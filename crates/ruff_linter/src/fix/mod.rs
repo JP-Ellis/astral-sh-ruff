@@ -165,6 +165,7 @@ mod tests {
                 range: edit.range(),
                 fix: Some(Fix::safe_edit(edit)),
                 parent: None,
+                noqa_edit: None,
             })
             .collect()
     }
