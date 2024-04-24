@@ -5,6 +5,7 @@ use std::iter::{Copied, DoubleEndedIterator, FusedIterator};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
+use bitflags::bitflags;
 use hashbrown::hash_map::{Keys, RawEntryMut};
 use rustc_hash::{FxHashMap, FxHasher};
 
@@ -79,14 +80,35 @@ impl Scope {
     }
 }
 
+bitflags! {
+    #[derive(Debug)]
+    pub(crate) struct SymbolFlags: u8 {
+        const IS_USED         = 1 << 0;
+        const IS_DEFINED      = 1 << 1;
+        const MARKED_GLOBAL   = 1 << 2;
+        const MARKED_NONLOCAL = 1 << 3;
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Symbol {
     name: Name,
+    flags: SymbolFlags,
 }
 
 impl Symbol {
     pub(crate) fn name(&self) -> &str {
         self.name.as_str()
+    }
+
+    /// Is the symbol used in its containing scope?
+    pub(crate) fn is_used(&self) -> bool {
+        self.flags.contains(SymbolFlags::IS_USED)
+    }
+
+    /// Is the symbol defined in its containing scope?
+    pub(crate) fn is_defined(&self) -> bool {
+        self.flags.contains(SymbolFlags::IS_DEFINED)
     }
 }
 
@@ -233,7 +255,12 @@ impl SymbolTable {
             .unwrap_or_default()
     }
 
-    fn add_symbol_to_scope(&mut self, scope_id: ScopeId, name: &str) -> SymbolId {
+    fn add_symbol_to_scope(
+        &mut self,
+        scope_id: ScopeId,
+        name: &str,
+        flags: SymbolFlags,
+    ) -> SymbolId {
         let hash = SymbolTable::hash_name(name);
         let scope = &mut self.scopes_by_id[scope_id];
         let name = Name::new(name);
@@ -244,9 +271,14 @@ impl SymbolTable {
             .from_hash(hash, |existing| self.symbols_by_id[*existing].name == name);
 
         match entry {
-            RawEntryMut::Occupied(entry) => *entry.key(),
+            RawEntryMut::Occupied(entry) => {
+                self.symbols_by_id.get_mut(*entry.key()).map(|symbol| {
+                    symbol.flags.insert(flags);
+                });
+                *entry.key()
+            }
             RawEntryMut::Vacant(entry) => {
-                let id = self.symbols_by_id.push(Symbol { name });
+                let id = self.symbols_by_id.push(Symbol { name, flags });
                 entry.insert_with_hasher(hash, id, (), |_| hash);
                 id
             }
@@ -352,12 +384,13 @@ struct SymbolTableBuilder {
 }
 
 impl SymbolTableBuilder {
-    fn add_symbol(&mut self, identifier: &str) -> SymbolId {
-        self.table.add_symbol_to_scope(self.cur_scope(), identifier)
+    fn add_symbol(&mut self, identifier: &str, flags: SymbolFlags) -> SymbolId {
+        self.table
+            .add_symbol_to_scope(self.cur_scope(), identifier, flags)
     }
 
     fn add_symbol_with_def(&mut self, identifier: &str, definition: Definition) -> SymbolId {
-        let symbol_id = self.add_symbol(identifier);
+        let symbol_id = self.add_symbol(identifier, SymbolFlags::IS_DEFINED);
         self.table
             .defs
             .entry(symbol_id)
@@ -399,7 +432,7 @@ impl SymbolTableBuilder {
                     ast::TypeParam::ParamSpec(ast::TypeParamParamSpec { name, .. }) => name,
                     ast::TypeParam::TypeVarTuple(ast::TypeParamTypeVarTuple { name, .. }) => name,
                 };
-                self.add_symbol(name);
+                self.add_symbol(name, SymbolFlags::IS_USED);
             }
         }
         nested(self);
@@ -411,8 +444,14 @@ impl SymbolTableBuilder {
 
 impl PreorderVisitor<'_> for SymbolTableBuilder {
     fn visit_expr(&mut self, expr: &ast::Expr) {
-        if let ast::Expr::Name(ast::ExprName { id, .. }) = expr {
-            self.add_symbol(id);
+        if let ast::Expr::Name(ast::ExprName { id, ctx, .. }) = expr {
+            let flags = match ctx {
+                ast::ExprContext::Load => SymbolFlags::IS_USED,
+                ast::ExprContext::Store => SymbolFlags::IS_DEFINED,
+                ast::ExprContext::Del => SymbolFlags::IS_DEFINED,
+                ast::ExprContext::Invalid => SymbolFlags::empty(),
+            };
+            self.add_symbol(id, flags);
         }
         ast::visitor::preorder::walk_expr(self, expr);
     }
@@ -502,7 +541,7 @@ mod tests {
     use crate::parse::Parsed;
     use crate::symbols::ScopeKind;
 
-    use super::{SymbolId, SymbolIterator, SymbolTable};
+    use super::{SymbolFlags, SymbolId, SymbolIterator, SymbolTable};
 
     mod from_ast {
         use super::*;
@@ -721,8 +760,8 @@ mod tests {
     fn insert_same_name_symbol_twice() {
         let mut table = SymbolTable::new();
         let root_scope_id = SymbolTable::root_scope_id();
-        let symbol_id_1 = table.add_symbol_to_scope(root_scope_id, "foo");
-        let symbol_id_2 = table.add_symbol_to_scope(root_scope_id, "foo");
+        let symbol_id_1 = table.add_symbol_to_scope(root_scope_id, "foo", SymbolFlags::empty());
+        let symbol_id_2 = table.add_symbol_to_scope(root_scope_id, "foo", SymbolFlags::empty());
         assert_eq!(symbol_id_1, symbol_id_2);
     }
 
@@ -730,8 +769,8 @@ mod tests {
     fn insert_different_named_symbols() {
         let mut table = SymbolTable::new();
         let root_scope_id = SymbolTable::root_scope_id();
-        let symbol_id_1 = table.add_symbol_to_scope(root_scope_id, "foo");
-        let symbol_id_2 = table.add_symbol_to_scope(root_scope_id, "bar");
+        let symbol_id_1 = table.add_symbol_to_scope(root_scope_id, "foo", SymbolFlags::empty());
+        let symbol_id_2 = table.add_symbol_to_scope(root_scope_id, "bar", SymbolFlags::empty());
         assert_ne!(symbol_id_1, symbol_id_2);
     }
 
@@ -739,9 +778,9 @@ mod tests {
     fn add_child_scope_with_symbol() {
         let mut table = SymbolTable::new();
         let root_scope_id = SymbolTable::root_scope_id();
-        let foo_symbol_top = table.add_symbol_to_scope(root_scope_id, "foo");
+        let foo_symbol_top = table.add_symbol_to_scope(root_scope_id, "foo", SymbolFlags::empty());
         let c_scope = table.add_child_scope(root_scope_id, "C", ScopeKind::Class);
-        let foo_symbol_inner = table.add_symbol_to_scope(c_scope, "foo");
+        let foo_symbol_inner = table.add_symbol_to_scope(c_scope, "foo", SymbolFlags::empty());
         assert_ne!(foo_symbol_top, foo_symbol_inner);
     }
 
