@@ -110,6 +110,7 @@ impl<'a> ConfigurationTransformer for EditorConfigurationTransformer<'a> {
         project_configuration: ruff_workspace::configuration::Configuration,
     ) -> ruff_workspace::configuration::Configuration {
         let ResolvedEditorSettings {
+            configuration,
             format_preview,
             lint_preview,
             select,
@@ -121,7 +122,7 @@ impl<'a> ConfigurationTransformer for EditorConfigurationTransformer<'a> {
 
         let project_root = self.1;
 
-        let editor_configuration = Configuration {
+        let mut editor_configuration = Configuration {
             lint: LintConfiguration {
                 preview: lint_preview.map(PreviewMode::from),
                 rule_selections: vec![RuleSelection {
@@ -149,6 +150,24 @@ impl<'a> ConfigurationTransformer for EditorConfigurationTransformer<'a> {
             ..Default::default()
         };
 
+        if let Some(config_file_path) = configuration {
+            match open_configuration_file(&config_file_path, project_root) {
+                Ok(config_from_file) => {
+                    editor_configuration = editor_configuration.combine(config_from_file)
+                }
+                Err(err) => tracing::error!("Unable to find custom configuration file {err}"),
+            }
+        }
+
         editor_configuration.combine(project_configuration)
     }
+}
+
+fn open_configuration_file(
+    config_path: &Path,
+    project_root: &Path,
+) -> crate::Result<Configuration> {
+    let options = ruff_workspace::pyproject::load_options(&config_path)?;
+
+    Configuration::from_options(options, Some(&config_path), project_root)
 }
